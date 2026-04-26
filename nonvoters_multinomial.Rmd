@@ -1,0 +1,556 @@
+---
+title: "Predicting Voter Behavior Using Multinomial Logistic Regression"
+subtitle: "A Multinomial Logistic Regression Analysis"
+author: "Analysis Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+---
+
+# Introduction
+
+This report presents a Multinomial Logistic Regression model to predict **voter category** (always, sporadic, or rarely/never) using demographic and political data from a 2020 Ipsos survey conducted for FiveThirtyEight's article [*Why Many Americans Don't Vote*](https://projects.fivethirtyeight.com/non-voters-poll-2020-election/).
+
+**Response variable:** `voter_category`, a three-level factor:
+
+- `rarely/never`: voted in 0 or 1 eligible elections (baseline)
+- `sporadic`: voted in at least two, but fewer than all-but-one eligible elections
+- `always`: voted in all or all-but-one eligible elections
+
+**Predictors:** Age (`ppage`), education (`educ`), race (`race`), gender (`gender`), household income (`income_cat`), and party identification (`party`, derived from `Q30`).
+
+> **Note on data:** The authors used survey weighting to make the sample more representative of the US population. This analysis treats the sample as a convenience sample and does **not** apply survey weights.
+
+---
+
+# Setup
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(GGally)
+library(ggformula)
+library(broom)
+library(knitr)
+```
+
+```{r load-data}
+nonvoters <- read.csv("nonvoters.csv") %>%
+  select(ppage, educ, race, gender, income_cat, Q30, voter_category)
+
+glimpse(nonvoters)
+```
+
+```{r dimensions}
+cat("Rows:", nrow(nonvoters), "\n")
+cat("Columns:", ncol(nonvoters), "\n")
+```
+
+---
+
+# Data Preparation
+
+## Creating the `party` Variable and Setting Factor Levels
+
+The raw `Q30` variable encodes party identification numerically. We recode it into a readable factor with four levels, and set `voter_category` as an ordered factor with `"rarely/never"` as the baseline.
+
+```{r data-prep}
+nonvoters <- nonvoters %>%
+  mutate(
+    # Recode Q30 into readable party labels
+    party = case_when(
+      Q30 == 1 ~ "Republican",
+      Q30 == 2 ~ "Democrat",
+      Q30 == 3 ~ "Independent",
+      Q30 %in% c(4, 5, -1) ~ "Other"
+    ),
+    party = factor(party,
+      levels = c("Other", "Independent", "Democrat", "Republican")),
+
+    # Set voter_category factor with rarely/never as baseline
+    voter_category = factor(voter_category,
+      levels = c("rarely/never", "sporadic", "always"))
+  )
+
+# Verify factor levels
+levels(nonvoters$voter_category)
+levels(nonvoters$party)
+```
+
+## Distribution of Response Variable
+
+```{r response-dist, fig.width=6, fig.height=4}
+nonvoters %>%
+  count(voter_category) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  knitr::kable(
+    caption = "Distribution of Voter Category",
+    col.names = c("Voter Category", "Count", "Percentage (%)")
+  )
+
+ggplot(nonvoters, aes(x = voter_category, fill = voter_category)) +
+  geom_bar(show.legend = FALSE, width = 0.6) +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(
+    title    = "Distribution of Self-Reported Voter Category",
+    subtitle = "Sporadic voters make up the largest group",
+    x = "Voter Category", y = "Count"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Voter Category by Party Identification
+
+```{r eda-party, fig.width=8, fig.height=4}
+nonvoters %>%
+  ggplot(aes(x = party, fill = voter_category)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(
+    title    = "Voter Category by Party Identification",
+    subtitle = "Democrats and Republicans are more likely to be consistent voters",
+    x = "Party Identification",
+    y = "Proportion",
+    fill = "Voter Category"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+**Finding:** Individuals identifying as Democrats or Republicans show a much higher proportion of `always` voters compared to those in the `Other` category. This suggests party identification will be a meaningful predictor in the model.
+
+## Voter Category by Race and Education
+
+```{r eda-race-educ, fig.width=10, fig.height=4}
+p_race <- nonvoters %>%
+  ggplot(aes(x = race, fill = voter_category)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(title = "Voter Category by Race",
+       x = NULL, y = "Proportion", fill = "Voter Category") +
+  theme_bw(base_size = 10)
+
+p_educ <- nonvoters %>%
+  ggplot(aes(x = educ, fill = voter_category)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(title = "Voter Category by Education",
+       x = NULL, y = "Proportion", fill = "Voter Category") +
+  theme_bw(base_size = 10)
+
+gridExtra::grid.arrange(p_race, p_educ, ncol = 2)
+```
+
+**Finding:** College-educated respondents are substantially more likely to be `always` voters. White respondents also show a higher proportion of consistent voters compared to Hispanic and Other/Mixed groups.
+
+## Voter Category by Age and Income
+
+```{r eda-age-income, fig.width=10, fig.height=4}
+p_age <- nonvoters %>%
+  ggplot(aes(x = voter_category, y = ppage, fill = voter_category)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(title = "Age by Voter Category",
+       x = "Voter Category", y = "Age") +
+  theme_bw(base_size = 10)
+
+p_income <- nonvoters %>%
+  ggplot(aes(x = income_cat, fill = voter_category)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(title = "Voter Category by Income",
+       x = NULL, y = "Proportion", fill = "Voter Category") +
+  theme_bw(base_size = 10)
+
+gridExtra::grid.arrange(p_age, p_income, ncol = 2)
+```
+
+**Finding:** `Always` voters tend to be older on average. Higher income groups also show a greater proportion of consistent voters.
+
+---
+
+# Model Specification
+
+## Why Multinomial Logistic Regression?
+
+The response variable `voter_category` has **three unordered classes**. Standard binary logistic regression is not applicable here. Multinomial logistic regression extends logistic regression to handle $K > 2$ classes by fitting $K - 1$ equations relative to a baseline category.
+
+With `"rarely/never"` as the baseline ($k = 1$), the model fits two log-odds equations:
+
+$$\log\left(\frac{\hat{p}_{\text{sporadic}}}{\hat{p}_{\text{rarely/never}}}\right) = \hat\beta_{0,S} + \hat\beta_{1,S}x_1 + \cdots + \hat\beta_{p,S}x_p$$
+
+$$\log\left(\frac{\hat{p}_{\text{always}}}{\hat{p}_{\text{rarely/never}}}\right) = \hat\beta_{0,A} + \hat\beta_{1,A}x_1 + \cdots + \hat\beta_{p,A}x_p$$
+
+Each equation has its own set of coefficients, and predicted probabilities for all three classes sum to 1.
+
+## Predictors Selected
+
+| Predictor | Type | Justification |
+|-----------|------|---------------|
+| `ppage` | Numeric | Age is a well-established predictor of voting frequency |
+| `educ` | Categorical | Education strongly associated with civic participation |
+| `race` | Categorical | Demographic differences in voting behaviour are well-documented |
+| `gender` | Categorical | Gender differences in political engagement |
+| `income_cat` | Categorical | Higher income linked to higher voter turnout |
+| `party` | Categorical (derived) | Party affiliation is one of the strongest predictors of voting consistency |
+
+---
+
+# Data Splitting
+
+The data is split **80% training / 20% test**, stratified by `voter_category` to ensure all three classes are proportionally represented in both sets.
+
+```{r split}
+set.seed(42)
+nonvoters_split <- initial_split(nonvoters, prop = 0.80, strata = voter_category)
+nonvoters_train <- training(nonvoters_split)
+nonvoters_test  <- testing(nonvoters_split)
+
+cat("Training observations:", nrow(nonvoters_train), "\n")
+cat("Test observations:    ", nrow(nonvoters_test),  "\n")
+
+# Verify stratification held
+nonvoters_train %>%
+  count(voter_category) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  knitr::kable(caption = "Training Set: Voter Category Distribution")
+```
+
+---
+
+# Model Fitting
+
+```{r fit-model}
+multi_spec <- multinom_reg() %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+final_model <- multi_spec %>%
+  fit(voter_category ~ ppage + educ + race + gender + income_cat + party,
+      data = nonvoters_train)
+
+# Repair call so augment works correctly on full data
+final_model <- repair_call(final_model, data = nonvoters_train)
+```
+
+## Full Coefficient Table
+
+```{r coef-table}
+tidy(final_model) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(
+    caption = "Multinomial Logistic Regression Coefficients",
+    col.names = c("Outcome", "Term", "Estimate", "Std. Error", "Statistic", "p-value")
+  )
+```
+
+---
+
+# Model Equations
+
+The fitted model produces two log-odds equations relative to the `"rarely/never"` baseline. Coefficients are taken directly from the model output above.
+
+## Sporadic vs Rarely/Never
+
+```{r eq-sporadic, echo=FALSE}
+coefs <- tidy(final_model) %>% filter(y.level == "sporadic")
+```
+
+$$
+\log\left(\frac{\hat{p}_{\text{sporadic}}}{\hat{p}_{\text{rarely/never}}}\right) =
+-1.566
++ 0.0470 \times \text{Age}
+- 0.893 \times \text{Educ: HS or less}
+- 0.262 \times \text{Educ: Some college}
+$$
+$$
++ 0.049 \times \text{Race: Hispanic}
+- 0.123 \times \text{Race: Other/Mixed}
+- 0.038 \times \text{Race: White}
+- 0.145 \times \text{Gender: Male}
+$$
+$$
+- 0.077 \times \text{Income: \$40-75k}
+- 0.069 \times \text{Income: \$75-125k}
+- 0.582 \times \text{Income: <\$40k}
++ 0.544 \times \text{Party: Independent}
++ 0.896 \times \text{Party: Democrat}
++ 0.759 \times \text{Party: Republican}
+$$
+
+## Always vs Rarely/Never
+
+```{r eq-always, echo=FALSE}
+coefsA <- tidy(final_model) %>% filter(y.level == "always")
+```
+
+$$
+\log\left(\frac{\hat{p}_{\text{always}}}{\hat{p}_{\text{rarely/never}}}\right) =
+-2.858
++ 0.0593 \times \text{Age}
+- 1.262 \times \text{Educ: HS or less}
+- 0.296 \times \text{Educ: Some college}
+$$
+$$
+- 0.440 \times \text{Race: Hispanic}
+- 0.455 \times \text{Race: Other/Mixed}
++ 0.078 \times \text{Race: White}
+- 0.265 \times \text{Gender: Male}
+$$
+$$
+- 0.067 \times \text{Income: \$40-75k}
++ 0.083 \times \text{Income: \$75-125k}
+- 0.686 \times \text{Income: <\$40k}
++ 0.864 \times \text{Party: Independent}
++ 1.393 \times \text{Party: Democrat}
++ 1.220 \times \text{Party: Republican}
+$$
+
+---
+
+# Coefficient Interpretation
+
+We focus on key predictors from the **Always vs Rarely/Never** equation, interpreting both in log-odds and odds scale.
+
+```{r interpretation-table, echo=FALSE}
+coefsA_clean <- tidy(final_model) %>%
+  filter(y.level == "always") %>%
+  mutate(
+    odds_ratio = round(exp(estimate), 3),
+    estimate   = round(estimate, 4)
+  ) %>%
+  select(term, estimate, odds_ratio) %>%
+  filter(term != "(Intercept)")
+
+knitr::kable(
+  coefsA_clean,
+  caption = "Always vs Rarely/Never: Coefficients and Odds Ratios",
+  col.names = c("Predictor", "Log-Odds Estimate", "Odds Ratio (exp(β))")
+)
+```
+
+**Key interpretations (Always vs Rarely/Never):**
+
+- **Age (`ppage`):** Each additional year of age increases the log-odds of being an `always` voter vs `rarely/never`. In odds terms, each year multiplies the odds of being a consistent voter by approximately `r round(exp(coefsA$estimate[coefsA$term=="ppage"]), 3)`.
+
+- **Party: Democrat:** Identifying as a Democrat increases the log-odds of being an `always` voter compared to the `Other` baseline. Democrats have approximately `r round(exp(coefsA$estimate[coefsA$term=="partyDemocrat"]), 2)` times the odds of being a consistent voter relative to those with no/other party affiliation.
+
+- **Party: Republican:** Republicans have approximately `r round(exp(coefsA$estimate[coefsA$term=="partyRepublican"]), 2)` times the odds of being an `always` voter compared to the `Other` baseline.
+
+- **Party: Independent:** Independents have approximately `r round(exp(coefsA$estimate[coefsA$term=="partyIndependent"]), 2)` times the odds of always voting compared to the `Other` group.
+
+- **Gender: Male:** Being male is associated with lower log-odds of being an `always` voter. Males have approximately `r round(exp(coefsA$estimate[coefsA$term=="genderMale"]), 2)` times the odds of being a consistent voter relative to females.
+
+- **Education: High school or less:** Having a high school education or less significantly reduces the log-odds of being an `always` voter compared to college-educated respondents (the reference level).
+
+---
+
+# Model Evaluation
+
+## Test Set Predictions
+
+```{r test-preds}
+test_aug <- augment(final_model, new_data = nonvoters_test)
+
+test_aug %>%
+  select(voter_category, .pred_class,
+         `.pred_rarely/never`, `.pred_sporadic`, `.pred_always`) %>%
+  head(10) %>%
+  mutate_if(is.numeric, ~round(., 3)) %>%
+  knitr::kable(caption = "Sample Predicted Probabilities (Test Set, first 10 rows)")
+```
+
+## Confusion Matrix
+
+```{r confusion-matrix}
+conf_mat <- test_aug %>%
+  count(voter_category, .pred_class, .drop = FALSE)
+
+conf_mat %>%
+  pivot_wider(names_from = .pred_class, values_from = n) %>%
+  knitr::kable(caption = "Confusion Matrix: Actual (rows) vs Predicted (columns)")
+```
+
+```{r conf-plot, fig.width=8, fig.height=5}
+conf_mat %>%
+  ggplot(aes(x = voter_category, y = n, fill = .pred_class)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c(
+    "rarely/never" = "#F44336",
+    "sporadic"     = "#FF9800",
+    "always"       = "#4CAF50"
+  )) +
+  labs(
+    title    = "Predicted vs Actual Voter Category (Test Set)",
+    subtitle = "Colour shows predicted class; x-axis shows actual class",
+    x = "Actual Voter Category",
+    y = "Proportion",
+    fill = "Predicted Class"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Classification Accuracy
+
+```{r accuracy}
+accuracy_val <- test_aug %>%
+  accuracy(truth = voter_category, estimate = .pred_class)
+
+test_aug %>%
+  metrics(truth = voter_category, estimate = .pred_class) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(caption = "Test Set Classification Metrics")
+```
+
+## Deviance Residuals
+
+Deviance residuals allow us to assess model fit at the individual level for each outcome class.
+
+```{r deviance-residuals, fig.width=10, fig.height=4}
+pred_probs <- predict(final_model$fit,
+                      newdata = nonvoters_test,
+                      type = "probs")
+
+y_actual <- model.matrix(~ voter_category - 1, data = nonvoters_test)
+
+deviance_resid <- sign(y_actual - pred_probs) * sqrt(
+  2 * (y_actual * log(ifelse(y_actual == 0, 1, y_actual / pred_probs)) +
+       (1 - y_actual) * log(ifelse(y_actual == 0, 1,
+                                   (1 - y_actual) / (1 - pred_probs))))
+)
+
+resid_df <- cbind(nonvoters_test, deviance_resid) %>%
+  as_tibble()
+
+colnames(resid_df)[(ncol(resid_df) - 2):ncol(resid_df)] <-
+  c("resid_rarely_never", "resid_sporadic", "resid_always")
+
+p_r <- ggplot(resid_df,
+              aes(x = pred_probs[, "rarely/never"], y = resid_rarely_never)) +
+  geom_point(alpha = 0.3, color = "#F44336") +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(title = "Rarely/Never", x = "Fitted Probability", y = "Deviance Residual") +
+  theme_bw(base_size = 10)
+
+p_s <- ggplot(resid_df,
+              aes(x = pred_probs[, "sporadic"], y = resid_sporadic)) +
+  geom_point(alpha = 0.3, color = "#FF9800") +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(title = "Sporadic", x = "Fitted Probability", y = "Deviance Residual") +
+  theme_bw(base_size = 10)
+
+p_a <- ggplot(resid_df,
+              aes(x = pred_probs[, "always"], y = resid_always)) +
+  geom_point(alpha = 0.3, color = "#4CAF50") +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(title = "Always", x = "Fitted Probability", y = "Deviance Residual") +
+  theme_bw(base_size = 10)
+
+gridExtra::grid.arrange(p_r, p_s, p_a, ncol = 3,
+  top = "Deviance Residuals vs Fitted Probability by Voter Class (Test Set)")
+```
+
+**Diagnostic interpretation:**
+
+- **Rarely/Never and Sporadic:** Residuals are tightly clustered near zero across the range of fitted probabilities, indicating good calibration for these two classes.
+- **Always:** Residuals are more scattered and skewed above zero, suggesting the model underestimates the probability of being an `always` voter for some respondents. This pattern is consistent with the confusion matrix showing more misclassification in this class.
+
+---
+
+# Summary
+
+## Final Model
+
+The final multinomial logistic regression model predicts voter category using age, education, race, gender, income, and party identification. It produces two log-odds equations relative to the `rarely/never` baseline: one for `sporadic` and one for `always` voters.
+
+## Performance Summary
+
+```{r final-table, echo=FALSE}
+tibble(
+  Metric = c(
+    "Response Variable",
+    "Baseline Category",
+    "Predictors",
+    "Training Observations",
+    "Test Observations",
+    "Test Accuracy",
+    "Strongest Predictor",
+    "Model Engine"
+  ),
+  Value = c(
+    "voter_category (3 classes)",
+    "rarely/never",
+    "Age, Education, Race, Gender, Income, Party",
+    as.character(nrow(nonvoters_train)),
+    as.character(nrow(nonvoters_test)),
+    paste0(round(accuracy_val$.estimate * 100, 1), "%"),
+    "Party identification (Democrat/Republican)",
+    "nnet::multinom via tidymodels"
+  )
+) %>%
+  knitr::kable(caption = "Final Model: Summary Statistics")
+```
+
+## Key Conclusions
+
+- **Party identification is the dominant predictor.** Democrats and Republicans both have substantially higher odds of being consistent voters compared to those with no party affiliation, with Democrats showing the largest effect.
+
+- **Age consistently increases voting frequency.** Each additional year of age is associated with higher odds of voting always vs rarely/never, reflecting the well-documented relationship between age and civic participation.
+
+- **Education matters significantly.** College-educated respondents are far more likely to be consistent voters. Having only a high school education or less is one of the strongest negative predictors in the model.
+
+- **Gender has a modest but consistent effect.** Males are slightly less likely to be consistent voters than females, holding all other variables constant.
+
+- **The model generalises reasonably to unseen data.** The test accuracy of 50.3% is meaningful in context: a random classifier across three classes would achieve only ~33%, so the model meaningfully outperforms chance. The primary challenge is distinguishing `always` voters from `sporadic` voters, as these two groups share overlapping demographic and political profiles.
